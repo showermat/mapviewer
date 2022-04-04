@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::ops::Add;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -10,8 +9,27 @@ use owning_ref::OwningHandle;
 
 mod parse;
 
-const LON_MAX: f64 = 179.9999;
-const LAT_MAX: f64 = 85.0511;
+pub const LON_MAX: f64 = 179.9999;
+pub const LAT_MAX: f64 = 85.0511;
+pub const COORD_MAX: i64 = 1 << 32;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coord {
+	pub x: i64,
+	pub y: i64
+}
+
+impl Coord {
+	pub fn add(&self, other: &Self) -> Self {
+		Self { x: self.x + other.x, y: self.y + other.y }
+	}
+}
+
+impl std::convert::From<(i64, i64)> for Coord {
+	fn from(t: (i64, i64)) -> Self {
+		Coord { x: t.0, y: t.1 }
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatLon {
@@ -31,10 +49,22 @@ impl LatLon {
 			lon: self.lon.clamp((-LON_MAX * 1e6) as i32, (LON_MAX * 1e6) as i32)
 		}
 	}
+
+	fn add(&self, other: &Self) -> Self {
+		Self { lat: self.lat + other.lat, lon: self.lon + other.lon }
+	}
+
+	pub fn to_coord(&self) -> Coord {
+		let lat_rad = (self.lat as f64 / 1000000.0).clamp(-LAT_MAX, LAT_MAX).to_radians();
+		Coord {
+			x: (self.lon + 180000000) as i64 * COORD_MAX / 360000000,
+			y: ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / 3.141593) / 2.0 * COORD_MAX as f64) as i64,
+		}
+	}
 }
 
 #[derive(Debug)]
-struct BoundingBox {
+struct LatLonBounds {
 	// All fields in microdegrees
 	lat_min: i32,
 	lon_min: i32,
@@ -42,7 +72,7 @@ struct BoundingBox {
 	lon_max: i32,
 }
 
-impl BoundingBox {
+impl LatLonBounds {
 	fn minmax(&self) -> (LatLon, LatLon) {
 		(LatLon::new(self.lat_max, self.lon_min), LatLon::new(self.lat_min, self.lon_max))
 	}
@@ -98,7 +128,7 @@ pub enum TagValue {
 	String(String),
 }
 
-fn tile_origin(level: u8, xtile: u32, ytile: u32) -> LatLon {
+pub fn tile_origin(level: u8, xtile: u32, ytile: u32) -> LatLon {
 	use std::f64::consts::PI;
 	let n = (2 as i32).pow(level as u32) as f64;
 	let lon = xtile as f64 / n * 360.0 - 180.0;
@@ -131,7 +161,7 @@ fn tileidx(level: u8, idx: u32) -> (u32, u32) {
 	(idx % n, idx / n)
 }
 
-fn num_tiles(level: u8, bounds: &BoundingBox) -> (u32, u32) {
+fn num_tiles(level: u8, bounds: &LatLonBounds) -> (u32, u32) {
 	let (min_coord, max_coord) = bounds.minmax();
 	let min = biased_coord2tile(level, min_coord, false);
 	let max = biased_coord2tile(level, max_coord, true);
@@ -141,7 +171,7 @@ fn num_tiles(level: u8, bounds: &BoundingBox) -> (u32, u32) {
 // Given the absolute indices of a tile in the given zoom level, figure out the number that
 // tile would get if all tiles covered by the given bounding box were counted off from zero in
 // reading order
-fn tile_idx_in_box(level: u8, bounds: &BoundingBox, xtile: u32, ytile: u32) -> Option<u32> {
+fn tile_idx_in_box(level: u8, bounds: &LatLonBounds, xtile: u32, ytile: u32) -> Option<u32> {
 	let (min_coord, max_coord) = bounds.minmax();
 	let min = biased_coord2tile(level, min_coord, false);
 	let max = biased_coord2tile(level, max_coord, true);
@@ -152,21 +182,15 @@ fn tile_idx_in_box(level: u8, bounds: &BoundingBox, xtile: u32, ytile: u32) -> O
 	}
 }
 
-// For a given tile, translate a list of lat/lon offsets from the tile origin to offsets that treat
-// the tile as a unit square
-fn translate_offsets(level: u8, xtile: u32, ytile: u32, offsets: &[LatLon]) -> Vec<(f64, f64)> {
+// For a given tile, translate a list of lat/lon offsets from the tile origin to absolute
+// coordinates relative to the top left of the map that treats the map as a square of side length
+// 2 ** 32 - 1.
+// TODO Consider caching translators for each (zoom, ytile) to avoid some of the initial calculations
+fn translate_offsets(zoom: u8, xtile: u32, ytile: u32, offsets: &[LatLon]) -> Vec<Coord> {
 	// TODO Do actual trig rather than stretching latitude
-	let tile_width = 2.0 * 360e6 / ((2 << (level as u32)) as f64); // TODO Cache this value
-	let tile_height = (tile_origin(level, xtile, ytile).lat - tile_origin(level, xtile, ytile + 1).lat) as f64;
-	let x_factor = 1.0 / tile_width;
-	let y_factor = -1.0 / tile_height;
-	let mut ret = vec![];
-	for offset in offsets {
-		let x = offset.lon as f64 * x_factor;
-		let y = offset.lat as f64 * y_factor;
-		ret.push((x, y));
-	}
-	ret
+	if xtile >= 1 << zoom || ytile >= 1 << zoom { panic!("Tile outside of zoom range"); } // TODO Return error
+	let origin = tile_origin(zoom, xtile, ytile);
+	offsets.iter().map(|offset| origin.add(offset).to_coord()).collect()
 }
 
 #[derive(Debug)]
@@ -198,7 +222,7 @@ pub struct Way {
 }
 
 impl Way {
-	pub fn project(&self, tile: &Tile) -> Vec<Vec<Vec<(f64, f64)>>> {
+	pub fn project(&self, tile: &Tile) -> Vec<Vec<Vec<Coord>>> {
 		let mut ret = vec![];
 		for block in self.blocks.as_slice() {
 			let mut blockdata = vec![];
@@ -231,7 +255,7 @@ impl Tile {
 		Self { zoom, index: (xtile, ytile), ways: vec![], pois: vec![] }
 	}
 
-	fn project(&self, offsets: &[LatLon]) -> Vec<(f64, f64)> {
+	fn project(&self, offsets: &[LatLon]) -> Vec<Coord> {
 		translate_offsets(self.zoom, self.index.0, self.index.1, offsets)
 	}
 }
@@ -241,7 +265,7 @@ pub struct MapHeader {
 	version: u32,
 	size: u64,
 	created: u64,
-	bounds: BoundingBox,
+	bounds: LatLonBounds,
 	pub tile_size: u16,
 	projection: String,
 	debug: bool,
@@ -281,33 +305,27 @@ impl MapFile {
 		Self { path, data: Arc::new(data), header: header, zoom_interval_map: zoom_map, indices }
 	}
 
+	pub fn path<'a>(&'a self) -> &'a Path {
+		&self.path
+	}
+
 	pub fn header<'a>(&'a self) -> &'a MapHeader {
 		&self.header
 	}
 
-	pub fn bounds(&self, zoom: u8) -> ((f64, f64), (f64, f64)) {
-		let (free_min, free_max) = self.header.bounds.minmax();
-		let (min, max) = (free_min.constrain(), free_max.constrain());
-		let (min_xtile, min_ytile) = coord2tile(zoom, min);
-		let minorig = tile_origin(zoom, min_xtile, min_ytile);
-		let minoff = LatLon { lat: min.lat - minorig.lat, lon: min.lon - minorig.lon };
-		let translated_min = translate_offsets(zoom, min_xtile, min_ytile, &vec![minoff])[0];
-		let (max_xtile, max_ytile) = coord2tile(zoom, max);
-		let maxorig = tile_origin(zoom, max_xtile, max_ytile);
-		let maxoff = LatLon { lat: max.lat - maxorig.lat, lon: max.lon - maxorig.lon };
-		let translated_max = translate_offsets(zoom, max_xtile, max_ytile, &vec![maxoff])[0];
-		(
-			(min_xtile as f64 + translated_min.0, min_ytile as f64 + translated_min.1),
-			(max_xtile as f64 + translated_max.0, max_ytile as f64 + translated_max.1)
-		)
+	pub fn bounds(&self) -> (Coord, Coord) {
+		let (min, max) = self.header.bounds.minmax();
+		(min.constrain().to_coord(), max.constrain().to_coord())
+		
 	}
 
-	pub fn desired_zoom_level(&self, cur_zoom: u8, tile_size: f32) -> u8 {
-		let zoom_adj = (cur_zoom as f32 + (tile_size / self.header.tile_size as f32).log2().round()).clamp(0.0, 22.0) as u8;
-		if let Some(base_zoom) = self.zoom_interval_map.get(&zoom_adj) {
-			self.header.zoom_intervals[*base_zoom as usize].base
+	pub fn desired_zoom_level(&self, deg_lon_per_px: f64) -> Option<u8> {
+		let ideal_deg_per_tile = deg_lon_per_px * self.header.tile_size as f64;
+		let target_zoom = (360.0 / ideal_deg_per_tile).log2().round().clamp(0.0, 22.0) as u8;
+		if let Some(base_zoom) = self.zoom_interval_map.get(&target_zoom) {
+			Some(self.header.zoom_intervals[*base_zoom as usize].base)
 		}
-		else { cur_zoom }
+		else { None }
 	}
 
 	pub fn tile(&self, zoom: u8, x: u32, y: u32) -> Tile {
@@ -418,7 +436,7 @@ fn test_tile_idx_in_box() {
 		(2, (-50, -100, 80, 90), (3, 1), None),
 	];
 	for (level, bounds, tile, expected) in tests {
-		let bounding_box = BoundingBox { lat_min: bounds.0 * 1000000, lon_min: bounds.1 * 1000000, lat_max: bounds.2 * 1000000, lon_max: bounds.3 * 1000000 };
+		let bounding_box = LatLonBounds { lat_min: bounds.0 * 1000000, lon_min: bounds.1 * 1000000, lat_max: bounds.2 * 1000000, lon_max: bounds.3 * 1000000 };
 		let actual = tile_idx_in_box(level, &bounding_box, tile.0, tile.1);
 		assert_eq!(actual, expected, "Index of tile {:?} in bounds {:?} at zoom {} is {:?}, but expected {:?}", tile, bounds, level, actual, expected);
 	}

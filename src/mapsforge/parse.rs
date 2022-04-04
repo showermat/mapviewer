@@ -7,7 +7,7 @@ use nom::number::complete::{be_f32, be_i8, be_i16, be_i32, be_u8, be_u16, be_u32
 use nom::sequence::*;
 use nom::IResult;
 
-use super::{BoundingBox, LatLon, MapHeader, Poi, TagDesc, TagValue, TileHeader, TileIndex, Tile, Way, ZoomInterval};
+use super::{LatLonBounds, LatLon, MapHeader, Poi, TagDesc, TagValue, TileHeader, TileIndex, Tile, Way, ZoomInterval};
 
 fn vbe_u(i: &[u8]) -> IResult<&[u8], u64> {
 	let (i, (rest, first)) = pair(take_while(|c| c & 0x80 != 0), be_u8)(i)?;
@@ -72,7 +72,7 @@ pub fn header(i: &[u8]) -> IResult<&[u8], MapHeader> {
 		version: begin.1,
 		size: begin.2,
 		created: begin.3,
-		bounds: BoundingBox { lat_min: begin.4, lon_min: begin.5, lat_max: begin.6, lon_max: begin.7 },
+		bounds: LatLonBounds { lat_min: begin.4, lon_min: begin.5, lat_max: begin.6, lon_max: begin.7 },
 		tile_size: begin.8,
 		projection: begin.9,
 		debug: flags & 0x80 != 0,

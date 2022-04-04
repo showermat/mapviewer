@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -11,9 +12,11 @@ use sdl2::mouse::MouseButton;
 mod render;
 mod mapsforge;
 
-use render::{Geometry, Material, RenderCache};
+use mapsforge::Coord;
+use render::{BoundingBox, Geometry, Material, RenderCache};
 
-const ZOOM_MULTIPLIER: f32 = 1.2;
+const ZOOM_MULTIPLIER: f64 = 1.2;
+const MAX_DETAIL: i64 = 10; // Smallest feature to display in pixels
 
 struct UpdateEvent { }
 
@@ -111,10 +114,9 @@ impl Events {
 struct Viewer {
 	i: u64,
 	size: (u32, u32),
-	offset: (i32, i32),
-	old_offset: (i32, i32),
-	scale: f32,
-	zoom: u8,
+	offset: Coord, // Offset of viewport from origin in coord units
+	old_offset: Coord,
+	scale: u32, // Coord units per pixel -- larger is zooming out
 	font: Font,
 	text_paint: Paint,
 	paints: HashMap<Material, Paint>,
@@ -122,14 +124,6 @@ struct Viewer {
 }
 
 impl Viewer {
-	fn fit_to_screen(&mut self) {
-		let (w, h) = self.size;
-		let ((minx, miny), (maxx, maxy)) = self.render.map.bounds(self.zoom);
-		self.scale = (w as f64 / (maxx - minx)).min(h as f64 / (maxy - miny)) as f32;
-		//self.offset = ((-minx * self.scale as f64) as i32, (-miny * self.scale as f64) as i32);
-		self.offset = (((w as f64 - (minx + maxx) * self.scale as f64) / 2.0) as i32, ((h as f64 - (miny + maxy) * self.scale as f64) / 2.0) as i32);
-	}
-
 	fn paint_styles() -> HashMap<Material, Paint> {
 		let mut ret = HashMap::new();
 		ret.insert(Material::Unknown, {
@@ -156,7 +150,7 @@ impl Viewer {
 		ret
 	}
 
-	fn new(map: mapsforge::MapFile, init_size: (u32, u32)) -> Self {
+	fn new(maps: Vec<mapsforge::MapFile>, init_size: (u32, u32)) -> Self {
 		let mut font = Font::default();
 		font.set_size(10.0);
 		let paints = Self::paint_styles();
@@ -164,12 +158,17 @@ impl Viewer {
 		text_paint.set_anti_alias(true);
 		text_paint.set_style(paint::Style::Fill);
 		text_paint.set_stroke(false);
-		let mut ret = Self { i: 0, size: init_size, offset: (0, 0), old_offset: (0, 0), scale: 1.0, zoom: 5, font, text_paint, paints, render: RenderCache::new(map) };
-		ret.fit_to_screen();
-		ret
+		let render = RenderCache::new(maps);
+		let bounds = render.bounds();
+		let scale = (bounds.width() as u32 / init_size.0).max(bounds.height() as u32 / init_size.1);
+		let viewport_adj = Coord { x: -(scale as i64 * init_size.0 as i64) / 2, y: -(scale as i64 * init_size.1 as i64) / 2 };
+		let offset = bounds.midpoint().unwrap().add(&viewport_adj);
+		Self { i: 0, size: init_size, offset, old_offset: offset, scale, font, text_paint, paints, render }
 	}
 
-	fn scale(&mut self, factor: f32, center: (i32, i32)) {
+	fn viewport(&self) -> BoundingBox {
+		let winsize = Coord { x: self.size.0 as i64 * self.scale as i64, y: self.size.1 as i64 * self.scale as i64 };
+		BoundingBox::from_corners((self.offset, self.offset.add(&winsize)))
 	}
 
 	fn update(&mut self, events: &mut Events, size: (u32, u32)) -> bool {
@@ -177,83 +176,78 @@ impl Viewer {
 		self.size = size;
 		let mut update = false;
 
+		// TODO Try scrolling mouse wheel while dragging
 		if events.button_change > 0 { self.old_offset = self.offset; }
 		if let Some(start) = events.drag_start {
 			let cur_offset = self.offset;
-			self.offset = (self.old_offset.0 + events.mouse_pos.0 - start.0, self.old_offset.1 + events.mouse_pos.1 - start.1);
+			self.offset = Coord {
+				x: self.old_offset.x - (events.mouse_pos.0 - start.0) as i64 * self.scale as i64,
+				y: self.old_offset.y - (events.mouse_pos.1 - start.1) as i64 * self.scale as i64,
+			};
 			if self.offset != cur_offset { update = true; }
 		}
 		if events.wheel != 0 {
-			let scale_mul = ZOOM_MULTIPLIER.powf(events.wheel as f32);
-			let center = events.mouse_pos;
+			let scale_mul = ZOOM_MULTIPLIER.powf(events.wheel as f64);
+			let center = (events.mouse_pos.0 as i64, events.mouse_pos.1 as i64);
 			if scale_mul != 1.0 {
-				self.scale *= scale_mul;
-				let center_offset = (center.0 - self.offset.0, center.1 - self.offset.1);
-				let newxoff = center.0 - (center_offset.0 as f32 * scale_mul) as i32;
-				let newyoff = center.1 - (center_offset.1 as f32 * scale_mul) as i32;
-				self.offset = (newxoff, newyoff);
-				let new_zoom = self.render.map.desired_zoom_level(self.zoom, self.scale);
-				if new_zoom != self.zoom {
-					let factor = 2.0_f32.powf(self.zoom as f32 - new_zoom as f32);
-					self.scale *= factor;
-					self.zoom = new_zoom;
-				}
+				self.scale = (self.scale as f64 / scale_mul).round() as u32;
+				let factor = self.scale as f64 * (1.0 - scale_mul);
+				self.offset = Coord {
+					x: self.offset.x - (center.0 as f64 * factor) as i64,
+					y: self.offset.y - (center.1 as f64 * factor) as i64,
+				};
 				update = true;
 			}
 		}
 		update
 	}
 
-	fn place_tile(&mut self, canvas: &mut Canvas, tile: (u32, u32), loc: (f32, f32), scale: f32) {
-		let layers = &self.render.tile(self.zoom, tile.0, tile.1).layers;
-		let xform = |point: (f64, f64)| (point.0 as f32 * scale + loc.0, point.1 as f32 * scale + loc.1);
-		//canvas.draw_str(format!("{:?}", tile), xform((0.5, 0.5)), &self.font, &self.text_paint);
-		//let ((left, top), (right, bottom)) = (xform((0.0, 0.0)), xform((1.0, 1.0)));
-		//canvas.draw_rect(&Rect { top, left, bottom, right }, &self.paints[&Material::Unknown]);
-		for (_, objs) in layers {
+	fn place_tile(&mut self, canvas: &mut Canvas, tile: Arc<render::RenderTile>) {
+		let xform = |point: Coord| ((point.x - self.offset.x) / self.scale as i64, (point.y - self.offset.y) / self.scale as i64);
+		let downcast = |point: (i64, i64)| (point.0 as f32, point.1 as f32);
+		/*let bounds = tile.bounds();
+		canvas.draw_str(format!("{:?}", (tile.x, tile.y)), downcast(xform(bounds.midpoint().unwrap())), &self.font, &self.text_paint);
+		let (topleft, botright) = bounds.corners().unwrap();
+		let topleft = downcast(xform(topleft));
+		let botright = downcast(xform(botright));
+		canvas.draw_rect(&Rect { left: topleft.0, top: topleft.1, right: botright.0, bottom: botright.1 }, &self.paints[&Material::Unknown]);
+		return;*/
+		for (_, objs) in &tile.layers {
 			for obj in objs {
 				match &obj.geo {
 					Geometry::Point(point) => {
-						canvas.draw_point(xform(*point), &self.paints[&obj.material]);
+						canvas.draw_point(downcast(xform(*point)), &self.paints[&obj.material]);
 					},
 					Geometry::Path(polies) => {
 						let mut path = Path::new();
+						let mut bounds = BoundingBox::empty();
 						for poly in polies {
-							path.move_to(xform(poly[0]));
-							for point in poly[1..].into_iter() { path.line_to(xform(*point)); }
+							let transformed = xform(poly[0]);
+							path.move_to(downcast(transformed));
+							bounds.include(transformed.into());
+							for point in poly[1..].into_iter() {
+								let transformed = xform(*point);
+								path.line_to(downcast(transformed));
+								bounds.include(transformed.into());
+							}
 						}
-						canvas.draw_path(&path, &self.paints[&obj.material]);
+						if bounds.max_dimension() > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
 					},
 				}
 			}
 		}
 	}
 
-	fn visible_tiles(&self, zoom: u8, w: u32, h: u32) -> ((u32, u32), (u32, u32)) {
-		let ntiles = (1 << (zoom as u32)) as f32;
-		let xmin = (-self.offset.0 as f32 / self.scale).floor();
-		let xmax = ((w as i32 - self.offset.0) as f32 / self.scale).ceil();
-		let ymin = (-self.offset.1 as f32 / self.scale).floor();
-		let ymax = ((h as i32 - self.offset.1) as f32 / self.scale).ceil();
-		((xmin.clamp(0.0, ntiles) as u32, xmax.clamp(0.0, ntiles) as u32), (ymin.clamp(0.0, ntiles) as u32, ymax.clamp(0.0, ntiles) as u32))
-	}
-
 	fn draw(&mut self, canvas: &mut Canvas) {
-		let ISize { width: w, height: h } = canvas.base_layer_size();
 		canvas.clear(Color::from_argb(0, 0, 0, 255));
-		let (xrange, yrange) = self.visible_tiles(self.zoom, w as u32, h as u32);
-		for xtile in xrange.0 .. xrange.1 {
-			for ytile in yrange.0 .. yrange.1 {
-				let origin = (self.scale * xtile as f32 + self.offset.0 as f32, self.scale * ytile as f32 + self.offset.1 as f32);
-				self.place_tile(canvas, (xtile, ytile), origin, self.scale);
-			}
+		for tile in self.render.viewport_tiles(&self.viewport(), self.size.0) {
+			self.place_tile(canvas, tile);
 		}
 	}
 }
 
 fn main() {
-	let path = std::env::args().skip(1).next().unwrap();
-	let map = mapsforge::MapFile::new(PathBuf::from(path));
+	let maps: Vec<mapsforge::MapFile> = std::env::args().skip(1).map(|path| mapsforge::MapFile::new(PathBuf::from(path))).collect();
 	//map.test();
 
 	let sdl_context = sdl2::init().unwrap();
@@ -270,7 +264,7 @@ fn main() {
 		.build(&window, RafxExtents2D { width: size.0, height: size.1 }).unwrap();
 	let mut events = Events::new(&sdl_context);
 
-	let mut viewer = Viewer::new(map, (size.0, size.1));
+	let mut viewer = Viewer::new(maps, (size.0, size.1));
 	let mut redraw = true;
 
 	loop {
