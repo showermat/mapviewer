@@ -7,6 +7,7 @@ use std::time::Duration;
 use skulpin::rafx::api::RafxExtents2D;
 use skulpin::skia_safe::*;
 use sdl2::event::{Event, EventSender, WindowEvent};
+use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
 
 mod render;
@@ -16,7 +17,8 @@ use mapsforge::Coord;
 use render::{BoundingBox, Geometry, Material, RenderCache};
 
 const ZOOM_MULTIPLIER: f64 = 1.2;
-const MAX_DETAIL: i64 = 10; // Smallest feature to display in pixels
+const PAN_INCREMENT: i32 = 100;
+const MAX_DETAIL: i64 = 4; // Smallest feature to display in pixels
 
 struct UpdateEvent { }
 
@@ -37,10 +39,12 @@ struct Events {
 	should_quit: bool,
 	force_redraw: bool,
 	mouse_pos: (i32, i32),
+	prev_mouse_pos: (i32, i32),
 	drag_start: Option<(i32, i32)>,
 	button_change: i32,
 	clicks: u32,
 	wheel: i32,
+	keys: Vec<(Keycode, Mod)>,
 }
 
 impl Events {
@@ -57,10 +61,12 @@ impl Events {
 			should_quit: false,
 			force_redraw: true,
 			mouse_pos: mouse_pos,
+			prev_mouse_pos: mouse_pos,
 			drag_start: if mouse_state.left() { Some(mouse_pos) } else { None },
 			button_change: 0,
 			clicks: 0,
 			wheel: 0,
+			keys: vec![],
 		}
 	}
 
@@ -84,6 +90,7 @@ impl Events {
 		self.clicks = 0;
 		self.wheel = 0;
 		self.force_redraw = self.frames == 0;
+		self.keys = vec![];
 		for event in self.get_events(block) {
 			match event {
 				Event::Quit { .. } => self.should_quit = true,
@@ -103,10 +110,17 @@ impl Events {
 						_ => (),
 					}
 				},
+				Event::KeyDown { keycode, keymod, .. } => {
+					if let Some(code) = keycode {
+						self.keys.push((code, keymod));
+						if (code, keymod) == (Keycode::Q, Mod::empty()) { self.should_quit = true; }
+					}
+				}
 				_ => (),
 			}
 		}
 		let mouse_state = self.pump.mouse_state();
+		self.prev_mouse_pos = self.mouse_pos;
 		self.mouse_pos = (mouse_state.x(), mouse_state.y());
 	}
 }
@@ -115,7 +129,6 @@ struct Viewer {
 	i: u64,
 	size: (u32, u32),
 	offset: Coord, // Offset of viewport from origin in coord units
-	old_offset: Coord,
 	scale: u32, // Coord units per pixel -- larger is zooming out
 	font: Font,
 	text_paint: Paint,
@@ -147,6 +160,34 @@ impl Viewer {
 			paint.set_stroke(false);
 			paint
 		});
+		ret.insert(Material::Road, {
+			let mut paint = Paint::new(Color4f::new(0.1, 0.1, 0.1, 0.5), None);
+			paint.set_anti_alias(true);
+			paint.set_style(paint::Style::Stroke);
+			paint.set_stroke(true);
+			paint
+		});
+		ret.insert(Material::Building, {
+			let mut paint = Paint::new(Color4f::new(0.3, 0.3, 0.3, 0.5), None);
+			paint.set_anti_alias(true);
+			paint.set_style(paint::Style::Fill);
+			paint.set_stroke(false);
+			paint
+		});
+		ret.insert(Material::Greenspace, {
+			let mut paint = Paint::new(Color4f::new(0.8, 1.0, 0.8, 0.5), None);
+			paint.set_anti_alias(true);
+			paint.set_style(paint::Style::Fill);
+			paint.set_stroke(false);
+			paint
+		});
+		ret.insert(Material::Barrier, {
+			let mut paint = Paint::new(Color4f::new(0.5, 0.2, 0.0, 0.5), None);
+			paint.set_anti_alias(true);
+			paint.set_style(paint::Style::Stroke);
+			paint.set_stroke(true);
+			paint
+		});
 		ret
 	}
 
@@ -163,7 +204,7 @@ impl Viewer {
 		let scale = (bounds.width() as u32 / init_size.0).max(bounds.height() as u32 / init_size.1);
 		let viewport_adj = Coord { x: -(scale as i64 * init_size.0 as i64) / 2, y: -(scale as i64 * init_size.1 as i64) / 2 };
 		let offset = bounds.midpoint().unwrap().add(&viewport_adj);
-		Self { i: 0, size: init_size, offset, old_offset: offset, scale, font, text_paint, paints, render }
+		Self { i: 0, size: init_size, offset, scale, font, text_paint, paints, render }
 	}
 
 	fn viewport(&self) -> BoundingBox {
@@ -171,33 +212,60 @@ impl Viewer {
 		BoundingBox::from_corners((self.offset, self.offset.add(&winsize)))
 	}
 
-	fn update(&mut self, events: &mut Events, size: (u32, u32)) -> bool {
+	fn zoom(&mut self, factor: i32, center: (u32, u32)) {
+		let scale_mul = ZOOM_MULTIPLIER.powf(factor as f64);
+		self.scale = (self.scale as f64 / scale_mul).round() as u32;
+		let offset_mul = self.scale as f64 * (1.0 - scale_mul);
+		self.offset = Coord {
+			x: self.offset.x - (center.0 as f64 * offset_mul) as i64,
+			y: self.offset.y - (center.1 as f64 * offset_mul) as i64,
+		};
+	}
+
+	fn pan(&mut self, delta: (i32, i32)) {
+		self.offset = Coord {
+			x: self.offset.x - delta.0 as i64 * self.scale as i64,
+			y: self.offset.y - delta.1 as i64 * self.scale as i64,
+		};
+	}
+
+	fn update(&mut self, events: &Events, size: (u32, u32)) -> bool {
 		self.i = events.frames;
 		self.size = size;
 		let mut update = false;
 
-		// TODO Try scrolling mouse wheel while dragging
-		if events.button_change > 0 { self.old_offset = self.offset; }
-		if let Some(start) = events.drag_start {
-			let cur_offset = self.offset;
-			self.offset = Coord {
-				x: self.old_offset.x - (events.mouse_pos.0 - start.0) as i64 * self.scale as i64,
-				y: self.old_offset.y - (events.mouse_pos.1 - start.1) as i64 * self.scale as i64,
-			};
-			if self.offset != cur_offset { update = true; }
-		}
-		if events.wheel != 0 {
-			let scale_mul = ZOOM_MULTIPLIER.powf(events.wheel as f64);
-			let center = (events.mouse_pos.0 as i64, events.mouse_pos.1 as i64);
-			if scale_mul != 1.0 {
-				self.scale = (self.scale as f64 / scale_mul).round() as u32;
-				let factor = self.scale as f64 * (1.0 - scale_mul);
-				self.offset = Coord {
-					x: self.offset.x - (center.0 as f64 * factor) as i64,
-					y: self.offset.y - (center.1 as f64 * factor) as i64,
-				};
+		if events.drag_start.is_some() {
+			let delta = (events.mouse_pos.0 - events.prev_mouse_pos.0, events.mouse_pos.1 - events.prev_mouse_pos.1);
+			if delta != (0, 0) {
+				self.pan(delta);
 				update = true;
 			}
+		}
+		if events.wheel != 0 {
+			self.zoom(events.wheel, (events.mouse_pos.0.max(0) as u32, events.mouse_pos.1.max(0) as u32));
+			update = true;
+		}
+		let mut key_zoom = 0;
+		let mut key_pan = (0, 0);
+		for key in &events.keys {
+			if !key.1.is_empty() { continue; }
+			match key.0 {
+				Keycode::Equals | Keycode::KpPlus => { key_zoom += 1; },
+				Keycode::Minus | Keycode::KpMinus => { key_zoom -= 1; },
+				Keycode::Left | Keycode::H => { key_pan.0 += PAN_INCREMENT; },
+				Keycode::Right | Keycode::L => { key_pan.0 -= PAN_INCREMENT; },
+				Keycode::Up | Keycode::K => { key_pan.1 += PAN_INCREMENT; },
+				Keycode::Down | Keycode::J => { key_pan.1 -= PAN_INCREMENT; },
+				_ => {}
+			}
+		}
+		if key_pan != (0, 0) {
+			self.pan(key_pan);
+			update = true;
+		}
+		if key_zoom != 0 {
+			self.zoom(key_zoom, (self.size.0 / 2, self.size.1 / 2));
+			update = true;
 		}
 		update
 	}
@@ -216,7 +284,10 @@ impl Viewer {
 			for obj in objs {
 				match &obj.geo {
 					Geometry::Point(point) => {
-						canvas.draw_point(downcast(xform(*point)), &self.paints[&obj.material]);
+						/*canvas.draw_point(downcast(xform(*point)), &self.paints[&obj.material]);
+						if let Some(name) = &obj.name {
+							canvas.draw_str(name, downcast(xform(*point)), &self.font, &self.text_paint);
+						}*/
 					},
 					Geometry::Path(polies) => {
 						let mut path = Path::new();
@@ -248,7 +319,10 @@ impl Viewer {
 
 fn main() {
 	let maps: Vec<mapsforge::MapFile> = std::env::args().skip(1).map(|path| mapsforge::MapFile::new(PathBuf::from(path))).collect();
-	//map.test();
+	if maps.is_empty() {
+		println!("Nothing to display");
+		return;
+	}
 
 	let sdl_context = sdl2::init().unwrap();
 	let video = sdl_context.video().unwrap();

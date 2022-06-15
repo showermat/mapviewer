@@ -53,7 +53,17 @@ impl BoundingBox {
 	}
 
 	pub fn intersection(&self, other: &Self) -> Self {
-		unimplemented!();
+		if self.empty || other.empty { Self::empty() }
+		else {
+			let xmin = self.min.x.max(other.min.x);
+			let xmax = self.max.x.min(other.max.x);
+			let ymin = self.min.y.max(other.min.y);
+			let ymax = self.max.y.min(other.max.y);
+			if xmin > xmax || ymin > ymax { Self::empty() }
+			else {
+				Self { empty: false, min: Coord { x: xmin, y: ymin }, max: Coord { x: xmax, y: ymax } }
+			}
+		}
 	}
 
 	pub fn width(&self) -> i64 {
@@ -74,26 +84,52 @@ impl BoundingBox {
 	pub fn max_dimension(&self) -> i64 {
 		self.width().max(self.height())
 	}
+
+	pub fn is_empty(&self) -> bool {
+		self.max_dimension() == 0
+	}
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Material {
 	Unknown,
 	Land,
 	Water,
+	Road,
+	Building,
+	Barrier,
+	Greenspace,
 }
 
 impl Material {
-	fn from_tags(tags: &HashMap<String, TagValue>) -> Self {
-		match tags.get("natural") {
-			Some(TagValue::Literal(natural)) => match natural.as_ref() {
-				//"sea" => Self::Water,
-				//"nosea" => Self::Land,
-				"" => Self::Unknown,
-				_ => Self::Unknown,
-			},
-			_ => Self::Unknown,
+	fn from_tags(tags: &HashMap<String, TagValue>) -> Option<Self> {
+		if let Some(TagValue::Literal(natural)) = tags.get("natural") {
+			match natural.as_ref() {
+				"sea" | "water" => Some(Self::Water),
+				"nosea" => Some(Self::Land),
+				"grassland" | "heath" | "land" | "marsh" | "scrub" | "wetland" => Some(Self::Greenspace),
+				"" => None,
+				_ => None,
+			}
 		}
+		else if let Some(TagValue::Literal(leisure)) = tags.get("leisure") {
+			match leisure.as_ref() {
+				"dog_park" | "garden" | "nature_reserve" | "park" | "pitch" | "playground" => Some(Self::Greenspace),
+				"" => None,
+				_ => None,
+			}
+		}
+		else if let Some(TagValue::Literal(landuse)) = tags.get("landuse") {
+			match landuse.as_ref() {
+				"brownfield" | "cemetery" | "farm" | "farmland" | "farmyard" | "forest" | "grass" | "meadow" | "orchard" | "recreation_ground" | "village_green" | "vineyard" | "wood" => Some(Self::Greenspace),
+				"" => None,
+				_ => None,
+			}
+		}
+		else if tags.contains_key("building") { Some(Self::Building) }
+		else if tags.contains_key("highway") { Some(Self::Road) }
+		else if tags.contains_key("barrier") { Some(Self::Barrier) }
+		else { None }
 	}
 }
 
@@ -104,7 +140,7 @@ pub enum Geometry {
 
 pub struct Object {
 	pub geo: Geometry,
-	pub name: String,
+	pub name: Option<String>,
 	pub material: Material,
 }
 
@@ -119,9 +155,17 @@ impl RenderTile {
 	fn new(tile: mapsforge::Tile, zoom: u8, x: u32, y: u32) -> Self {
 		let mut layers = BTreeMap::new();
 		for way in &tile.ways {
-			for block in way.project(&tile) {
-				let geo = Geometry::Path(block);
-				layers.entry(way.layer).or_insert(vec![]).push(Object { geo, name: "".to_string(), material: Material::from_tags(&way.tags) });
+			if let Some(material) = Material::from_tags(&way.tags) {
+				for block in way.project(&tile) {
+					let geo = Geometry::Path(block);
+					layers.entry(way.layer).or_insert(vec![]).push(Object { geo, name: way.name.clone(), material });
+				}
+			}
+		}
+		for poi in &tile.pois {
+			if let Some(material) = Material::from_tags(&poi.tags) {
+				let geo = Geometry::Point(poi.project(&tile));
+				layers.entry(poi.layer).or_insert(vec![]).push(Object { geo, name: poi.name.clone(), material });
 			}
 		}
 		Self { zoom, x, y, layers }
@@ -161,6 +205,7 @@ impl RenderCache {
 		let deg_lon_per_px = viewport.width() as f64 * 360.0 / (winwidth as f64 * mapsforge::COORD_MAX as f64);
 		let mut ret = vec![];
 		for map in &self.maps {
+			if BoundingBox::from_corners(map.bounds()).intersection(viewport).is_empty() { continue; }
 			let maybe_zoom = map.desired_zoom_level(deg_lon_per_px);
 			if let Some(zoom) = maybe_zoom {
 				let (xrange, yrange) = visible_tiles(&viewport, zoom);

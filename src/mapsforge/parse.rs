@@ -9,17 +9,25 @@ use nom::IResult;
 
 use super::{LatLonBounds, LatLon, MapHeader, Poi, TagDesc, TagValue, TileHeader, TileIndex, Tile, Way, ZoomInterval};
 
+fn merge_vbe(first: u8, rest: &[u8]) -> u64 {
+	let mut ret = (first as u64) << (7 * rest.len());
+	let mut offset = 0;
+	for c in rest {
+		ret |= ((c & 0x7f) as u64) << offset;
+		offset += 7;
+	}
+	ret
+}
+
 fn vbe_u(i: &[u8]) -> IResult<&[u8], u64> {
 	let (i, (rest, first)) = pair(take_while(|c| c & 0x80 != 0), be_u8)(i)?;
-	let mut ret = first as u64;
-	for c in rest.into_iter().rev() { ret = (ret << 7) | (c & 0x7f) as u64; }
+	let ret = merge_vbe(first, &rest);
 	Ok((i, ret))
 }
 
 fn vbe_s(i: &[u8]) -> IResult<&[u8], i64> {
 	let (i, (rest, first)) = pair(take_while(|c| c & 0x80 != 0), be_u8)(i)?;
-	let mut ret = (first & 0x3f) as u64;
-	for c in rest.into_iter().rev() { ret = (ret << 7) | (c & 0x7f) as u64; }
+	let ret = merge_vbe(first & 0x3f, rest);
 	let mul = if first & 0x40 != 0 { -1 } else { 1 };
 	Ok((i, mul * (ret as i64)))
 }
@@ -120,7 +128,7 @@ fn tagmap<'a, 'b>(ntags: u8, tags: &'a [(String, TagDesc)], i: &'b [u8]) -> IRes
 	let (i, tag_ids) = count (|i| vbe_u(i), ntags as usize)(i)?;
 	let tag_descs = tag_ids.into_iter().map(|id| tags[id as usize].clone()).collect::<Vec<(String, TagDesc)>>();
 	let mut newi = i;
-	let mut tag_values = vec![];
+	let mut tag_values = Vec::with_capacity(tag_descs.len());
 	for desc in &tag_descs {
 		let (curi, tagval) = tag_value(&desc.1, newi)?;
 		tag_values.push(tagval);
@@ -198,7 +206,6 @@ fn way_block(double_delta: bool, i: &[u8]) -> IResult<&[u8], Vec<Vec<LatLon>>> {
 }
 
 pub fn way<'a, 'b>(debug: bool, tags: &'a [(String, TagDesc)], i: &'b [u8]) -> IResult<&'b [u8], Way> {
-	let start = i.as_ptr();
 	let (i, fields) = tuple((
 		cond(debug, take(32 as usize)), // Debug
 		vbe_u, // Size

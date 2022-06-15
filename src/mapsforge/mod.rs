@@ -182,17 +182,6 @@ fn tile_idx_in_box(level: u8, bounds: &LatLonBounds, xtile: u32, ytile: u32) -> 
 	}
 }
 
-// For a given tile, translate a list of lat/lon offsets from the tile origin to absolute
-// coordinates relative to the top left of the map that treats the map as a square of side length
-// 2 ** 32 - 1.
-// TODO Consider caching translators for each (zoom, ytile) to avoid some of the initial calculations
-fn translate_offsets(zoom: u8, xtile: u32, ytile: u32, offsets: &[LatLon]) -> Vec<Coord> {
-	// TODO Do actual trig rather than stretching latitude
-	if xtile >= 1 << zoom || ytile >= 1 << zoom { panic!("Tile outside of zoom range"); } // TODO Return error
-	let origin = tile_origin(zoom, xtile, ytile);
-	offsets.iter().map(|offset| origin.add(offset).to_coord()).collect()
-}
-
 #[derive(Debug)]
 pub struct TileIndex {
 	tile_offsets: Vec<u64>,
@@ -201,11 +190,18 @@ pub struct TileIndex {
 #[derive(Debug)]
 pub struct Poi {
 	offset: LatLon,
-	layer: i8,
-	tags: HashMap<String, TagValue>,
-	name: Option<String>,
-	house_number: Option<String>,
-	elevation: Option<i64>,
+	pub layer: i8,
+	pub tags: HashMap<String, TagValue>,
+	pub name: Option<String>,
+	pub house_number: Option<String>,
+	pub elevation: Option<i64>,
+}
+
+impl Poi {
+	pub fn project(&self, tile: &Tile) -> Coord {
+		// TODO We always translate all POIs in a tile, so optimize by making a single call to project() with all POIs together.
+		tile.project(&[self.offset])[0]
+	}
 }
 
 #[derive(Debug)]
@@ -216,7 +212,7 @@ pub struct Way {
 	pub tags: HashMap<String, TagValue>,
 	pub name: Option<String>,
 	pub house_number: Option<String>,
-	reference: Option<String>,
+	pub reference: Option<String>,
 	pub label_pos: Option<LatLon>,
 	blocks: Vec<Vec<Vec<LatLon>>>,
 }
@@ -255,8 +251,14 @@ impl Tile {
 		Self { zoom, index: (xtile, ytile), ways: vec![], pois: vec![] }
 	}
 
+	// For a given tile, translate a list of lat/lon offsets from the tile origin to absolute
+	// coordinates relative to the top left of the map that treats the map as a square of side
+	// length 2 ** 32 - 1.
 	fn project(&self, offsets: &[LatLon]) -> Vec<Coord> {
-		translate_offsets(self.zoom, self.index.0, self.index.1, offsets)
+		// TODO Do actual trig rather than stretching latitude
+		// TODO Cache origin rather than recalculating it every time
+		let origin = tile_origin(self.zoom, self.index.0, self.index.1);
+		offsets.iter().map(|offset| origin.add(offset).to_coord()).collect()
 	}
 }
 
@@ -362,28 +364,8 @@ impl MapFile {
 	}
 
 	pub fn test(&self) {
-		let zoom = &self.header.zoom_intervals[1];
-		
-		println!("{:#?}", self.header);
-		println!("Tiles: {:?}", num_tiles(zoom.base, &self.header.bounds));
-		let tile = self.indices[0].tile_offsets.iter().enumerate().find(|(_, x)| *x & 0x8000000000 == 0).unwrap().0;
-		println!("Examining tile {}", tile);
-		let tile_start = &self.indices[0].tile_offsets[tile] & 0x7fffffffff;
-		let (i, tile_header) = parse::tile_header(self.header.debug, zoom.max - zoom.min + 1, tile_start, &self.data[tile_start as usize ..]).unwrap();
-		println!("{:#?}", tile_header);
-		let tile_idx = tileidx(zoom.base, tile as u32);
-		
-		/*println!("Way 1 at offset {}", i.as_ptr() as usize - self.data.as_ptr() as usize);
-		let (i, way1) = parse::way(self.header.debug, &self.header.way_tags, i).unwrap();
-		println!("Way 1: {:#?}", way1);
-		println!("Way 2 at offset {}", i.as_ptr() as usize - self.data.as_ptr() as usize);
-		let (_, way2) = parse::way(self.header.debug, &self.header.way_tags, i).unwrap();
-		println!("Way 2: {:#?}", way2);*/
-
-		/*let way = parse::way(self.header.debug, zoom.tile_origin(tile_idx.0, tile_idx.1), &self.header.way_tags, &self.data[tile_header.way_start as usize .. ]).unwrap().1;
-		let ret =  vec![way.blocks[0][0].iter().map(|x| x.to_point()).collect()];
-		println!("{:?}", ret);
-		return ret;*/
+		for (name, desc) in &self.header.way_tags { println!("way\t{}\t{:?}", name, desc); }
+		for (name, desc) in &self.header.poi_tags { println!("poi\t{}\t{:?}", name, desc); }
 	}
 }
 
