@@ -191,6 +191,13 @@ impl Viewer {
 		ret
 	}
 
+	fn zoom_to_fit(&mut self) {
+		let bounds = self.render.bounds();
+		self.scale = (bounds.width() as u32 / self.size.0).max(bounds.height() as u32 / self.size.1);
+		let viewport_adj = Coord { x: -(self.scale as i64 * self.size.0 as i64) / 2, y: -(self.scale as i64 * self.size.1 as i64) / 2 };
+		self.offset = bounds.midpoint().unwrap().add(&viewport_adj);
+	}
+
 	fn new(maps: Vec<mapsforge::MapFile>, init_size: (u32, u32)) -> Self {
 		let mut font = Font::default();
 		font.set_size(10.0);
@@ -200,11 +207,9 @@ impl Viewer {
 		text_paint.set_style(paint::Style::Fill);
 		text_paint.set_stroke(false);
 		let render = RenderCache::new(maps);
-		let bounds = render.bounds();
-		let scale = (bounds.width() as u32 / init_size.0).max(bounds.height() as u32 / init_size.1);
-		let viewport_adj = Coord { x: -(scale as i64 * init_size.0 as i64) / 2, y: -(scale as i64 * init_size.1 as i64) / 2 };
-		let offset = bounds.midpoint().unwrap().add(&viewport_adj);
-		Self { i: 0, size: init_size, offset, scale, font, text_paint, paints, render }
+		let mut ret = Self { i: 0, size: init_size, offset: Coord { x: 0, y: 0 }, scale: 0, font, text_paint, paints, render };
+		ret.zoom_to_fit();
+		ret
 	}
 
 	fn viewport(&self) -> BoundingBox {
@@ -247,6 +252,7 @@ impl Viewer {
 		}
 		let mut key_zoom = 0;
 		let mut key_pan = (0, 0);
+		let mut reset = false;
 		for key in &events.keys {
 			if !key.1.is_empty() { continue; }
 			match key.0 {
@@ -256,23 +262,30 @@ impl Viewer {
 				Keycode::Right | Keycode::L => { key_pan.0 -= PAN_INCREMENT; },
 				Keycode::Up | Keycode::K => { key_pan.1 += PAN_INCREMENT; },
 				Keycode::Down | Keycode::J => { key_pan.1 -= PAN_INCREMENT; },
+				Keycode::Num0 => { reset = true; },
 				_ => {}
 			}
 		}
-		if key_pan != (0, 0) {
-			self.pan(key_pan);
+		if reset {
+			self.zoom_to_fit();
 			update = true;
 		}
-		if key_zoom != 0 {
-			self.zoom(key_zoom, (self.size.0 / 2, self.size.1 / 2));
-			update = true;
+		else {
+			if key_pan != (0, 0) {
+				self.pan(key_pan);
+				update = true;
+			}
+			if key_zoom != 0 {
+				self.zoom(key_zoom, (self.size.0 / 2, self.size.1 / 2));
+				update = true;
+			}
 		}
 		update
 	}
 
 	fn place_tile(&mut self, canvas: &mut Canvas, tile: Arc<render::RenderTile>) {
-		let xform = |point: Coord| ((point.x - self.offset.x) / self.scale as i64, (point.y - self.offset.y) / self.scale as i64);
-		let downcast = |point: (i64, i64)| (point.0 as f32, point.1 as f32);
+		//let xform = |point: Coord| ((point.x - self.offset.x) / self.scale as i64, (point.y - self.offset.y) / self.scale as i64);
+		let downcast = |point: Coord| (point.x as f32, point.y as f32);
 		/*let bounds = tile.bounds();
 		canvas.draw_str(format!("{:?}", (tile.x, tile.y)), downcast(xform(bounds.midpoint().unwrap())), &self.font, &self.text_paint);
 		let (topleft, botright) = bounds.corners().unwrap();
@@ -293,16 +306,14 @@ impl Viewer {
 						let mut path = Path::new();
 						let mut bounds = BoundingBox::empty();
 						for poly in polies {
-							let transformed = xform(poly[0]);
-							path.move_to(downcast(transformed));
-							bounds.include(transformed.into());
+							path.move_to(downcast(poly[0]));
+							bounds.include(poly[0].into());
 							for point in poly[1..].into_iter() {
-								let transformed = xform(*point);
-								path.line_to(downcast(transformed));
-								bounds.include(transformed.into());
+								path.line_to(downcast(*point));
+								bounds.include((*point).into());
 							}
 						}
-						if bounds.max_dimension() > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
+						if bounds.max_dimension() / self.scale as i64 > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
 					},
 				}
 			}
@@ -311,6 +322,8 @@ impl Viewer {
 
 	fn draw(&mut self, canvas: &mut Canvas) {
 		canvas.clear(Color::from_argb(0, 0, 0, 255));
+		canvas.scale(((1.0 / self.scale as f64) as f32, (1.0 / self.scale as f64) as f32));
+		canvas.translate((-self.offset.x as f32, -self.offset.y as f32));
 		for tile in self.render.viewport_tiles(&self.viewport(), self.size.0) {
 			self.place_tile(canvas, tile);
 		}
