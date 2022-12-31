@@ -8,6 +8,7 @@ edition = "2018"
 memmap = "0.7"
 nom = "6.0"
 owning_ref = "0.4"
+rayon = "1.5"
 skulpin = "0.14"
 skulpin-renderer = "0.14"
 sdl2 = { version = ">=0.33", features = ["bundled", "static-link", "raw-window-handle"] }

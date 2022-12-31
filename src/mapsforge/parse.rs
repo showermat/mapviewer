@@ -7,7 +7,7 @@ use nom::number::complete::{be_f32, be_i8, be_i16, be_i32, be_u8, be_u16, be_u32
 use nom::sequence::*;
 use nom::IResult;
 
-use super::{LatLonBounds, LatLon, MapHeader, Poi, TagDesc, TagValue, TileHeader, TileIndex, Tile, Way, ZoomInterval};
+use super::{LatLonBounds, LatLon, MapHeader, Poi, TagDesc, TagValue, TileHeader, TileIndex, Way, ZoomInterval};
 
 fn merge_vbe(first: u8, rest: &[u8]) -> u64 {
 	let mut ret = (first as u64) << (7 * rest.len());

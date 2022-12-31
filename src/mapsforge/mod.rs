@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 
 use memmap::Mmap;
-use owning_ref::OwningHandle;
 
 mod parse;
 

@@ -1,8 +1,10 @@
+#![feature(int_roundings)]
+
+extern crate rayon;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use skulpin::rafx::api::RafxExtents2D;
 use skulpin::skia_safe::*;
@@ -14,30 +16,37 @@ mod render;
 mod mapsforge;
 
 use mapsforge::Coord;
-use render::{BoundingBox, Geometry, Material, RenderCache};
+use render::{BoundingBox, Geometry, Material, RenderManager, RenderTile};
 
 const ZOOM_MULTIPLIER: f64 = 1.2;
 const PAN_INCREMENT: i32 = 100;
 const MAX_DETAIL: i64 = 4; // Smallest feature to display in pixels
 
-struct UpdateEvent { }
-
-struct Trigger {
-	sender: EventSender,
+enum UpdateEvent {
+	Tile { generation: u64, tile: Arc<RenderTile> },
 }
 
-impl Trigger {
-	fn trigger(&self) {
-		self.sender.push_custom_event(UpdateEvent { }).unwrap();
+#[derive(Clone)]
+pub struct Updater {
+	sender: Arc<EventSender>,
+}
+
+impl Updater {
+	fn send(&self, event: UpdateEvent) {
+		self.sender.push_custom_event(event).unwrap();
 	}
 }
+
+unsafe impl Send for Updater { }
+unsafe impl Sync for Updater { }
 
 struct Events {
 	pump: sdl2::EventPump,
 	subsystem: sdl2::EventSubsystem,
 	frames: u64,
-	should_quit: bool,
 	force_redraw: bool,
+	should_quit: bool,
+	tiles_ready: Vec<(u64, Arc<RenderTile>)>,
 	mouse_pos: (i32, i32),
 	prev_mouse_pos: (i32, i32),
 	drag_start: Option<(i32, i32)>,
@@ -58,8 +67,9 @@ impl Events {
 			pump: pump,
 			subsystem: subsys,
 			frames: 0,
+			force_redraw: false,
 			should_quit: false,
-			force_redraw: true,
+			tiles_ready: vec![],
 			mouse_pos: mouse_pos,
 			prev_mouse_pos: mouse_pos,
 			drag_start: if mouse_state.left() { Some(mouse_pos) } else { None },
@@ -70,13 +80,27 @@ impl Events {
 		}
 	}
 
-	fn get_trigger(&mut self) -> Trigger {
-		Trigger { sender: self.subsystem.event_sender() }
+	fn get_updater(&mut self) -> Updater {
+		Updater { sender: Arc::new(self.subsystem.event_sender()) }
 	}
 
 	fn get_events(&mut self, block: bool) -> Vec<Event> {
 		if block {
-			let mut ret = vec![self.pump.wait_event()];
+			let mut ret = vec![];
+			//let mut ret = vec![self.pump.wait_event()];
+			// TODO This loop is nasty and we should be able to replace it with the single line
+			// above, but for some reason the presence of user events added by another thread does
+			// not always cause wait_event to return.  In the loop below, we see the timeout being
+			// reached and returning no events, and then many events being immediately found when
+			// it is executed on the next run through the loop.  I assume this is something
+			// threading-related.  Until I can figure it out, this is a hack that gets us close
+			// enough.
+			loop {
+				if let Some(event) = self.pump.wait_event_timeout(500) {
+					ret.push(event);
+					break;
+				}
+			}
 			ret.extend(self.pump.poll_iter());
 			ret
 		}
@@ -89,7 +113,8 @@ impl Events {
 		self.button_change = 0;
 		self.clicks = 0;
 		self.wheel = 0;
-		self.force_redraw = self.frames == 0;
+		self.force_redraw = false;
+		//self.tiles_ready.clear();
 		self.keys = vec![];
 		for event in self.get_events(block) {
 			match event {
@@ -116,6 +141,11 @@ impl Events {
 						if (code, keymod) == (Keycode::Q, Mod::empty()) { self.should_quit = true; }
 					}
 				}
+				Event::User { .. } => {
+					match event.as_user_event_type::<UpdateEvent>().unwrap() {
+						UpdateEvent::Tile { generation, tile } => self.tiles_ready.push((generation, tile)),
+					}
+				}
 				_ => (),
 			}
 		}
@@ -126,14 +156,14 @@ impl Events {
 }
 
 struct Viewer {
-	i: u64,
 	size: (u32, u32),
 	offset: Coord, // Offset of viewport from origin in coord units
 	scale: u32, // Coord units per pixel -- larger is zooming out
 	font: Font,
 	text_paint: Paint,
 	paints: HashMap<Material, Paint>,
-	render: RenderCache,
+	render: RenderManager,
+	generation: u64,
 }
 
 impl Viewer {
@@ -198,7 +228,7 @@ impl Viewer {
 		self.offset = bounds.midpoint().unwrap().add(&viewport_adj);
 	}
 
-	fn new(maps: Vec<mapsforge::MapFile>, init_size: (u32, u32)) -> Self {
+	fn new(maps: Vec<Arc<mapsforge::MapFile>>, init_size: (u32, u32)) -> Self {
 		let mut font = Font::default();
 		font.set_size(10.0);
 		let paints = Self::paint_styles();
@@ -206,8 +236,8 @@ impl Viewer {
 		text_paint.set_anti_alias(true);
 		text_paint.set_style(paint::Style::Fill);
 		text_paint.set_stroke(false);
-		let render = RenderCache::new(maps);
-		let mut ret = Self { i: 0, size: init_size, offset: Coord { x: 0, y: 0 }, scale: 0, font, text_paint, paints, render };
+		let render = RenderManager::new(maps);
+		let mut ret = Self { size: init_size, offset: Coord { x: 0, y: 0 }, scale: 0, font, text_paint, paints, render, generation: 0 };
 		ret.zoom_to_fit();
 		ret
 	}
@@ -235,9 +265,9 @@ impl Viewer {
 	}
 
 	fn update(&mut self, events: &Events, size: (u32, u32)) -> bool {
-		self.i = events.frames;
+		let mut update = events.force_redraw;
+		if size != self.size || events.frames == 0 { update = true; }
 		self.size = size;
-		let mut update = false;
 
 		if events.drag_start.is_some() {
 			let delta = (events.mouse_pos.0 - events.prev_mouse_pos.0, events.mouse_pos.1 - events.prev_mouse_pos.1);
@@ -280,58 +310,70 @@ impl Viewer {
 				update = true;
 			}
 		}
+
+		if update { self.generation = events.frames; }
 		update
 	}
 
 	fn place_tile(&mut self, canvas: &mut Canvas, tile: Arc<render::RenderTile>) {
-		//let xform = |point: Coord| ((point.x - self.offset.x) / self.scale as i64, (point.y - self.offset.y) / self.scale as i64);
+		let xform = |point: Coord| Coord { x: (point.x - self.offset.x) / self.scale as i64, y: (point.y - self.offset.y) / self.scale as i64 };
 		let downcast = |point: Coord| (point.x as f32, point.y as f32);
-		/*let bounds = tile.bounds();
-		canvas.draw_str(format!("{:?}", (tile.x, tile.y)), downcast(xform(bounds.midpoint().unwrap())), &self.font, &self.text_paint);
+		let bounds = tile.bounds();
 		let (topleft, botright) = bounds.corners().unwrap();
 		let topleft = downcast(xform(topleft));
 		let botright = downcast(xform(botright));
-		canvas.draw_rect(&Rect { left: topleft.0, top: topleft.1, right: botright.0, bottom: botright.1 }, &self.paints[&Material::Unknown]);
+		canvas.draw_rect(Rect::new(topleft.0, topleft.1, botright.0, botright.1), &Paint::new(Color4f::new(0.0, 0.0, 0.0, 1.0), None));
+		/*canvas.draw_rect(Rect::new(topleft.0, topleft.1, botright.0, botright.1), &self.paints[&Material::Unknown]);
+		canvas.draw_str(format!("{:?} {}", (tile.x, tile.y), self.generation), downcast(xform(bounds.midpoint().unwrap())), &self.font, &self.text_paint);
 		return;*/
 		for (_, objs) in &tile.layers {
 			for obj in objs {
 				match &obj.geo {
 					Geometry::Point(point) => {
-						/*canvas.draw_point(downcast(xform(*point)), &self.paints[&obj.material]);
+						/*canvas.draw_point(downcast(*point), &self.paints[&obj.material]);
 						if let Some(name) = &obj.name {
-							canvas.draw_str(name, downcast(xform(*point)), &self.font, &self.text_paint);
+							canvas.draw_str(name, downcast(*point), &self.font, &self.text_paint);
 						}*/
 					},
 					Geometry::Path(polies) => {
 						let mut path = Path::new();
 						let mut bounds = BoundingBox::empty();
 						for poly in polies {
-							path.move_to(downcast(poly[0]));
-							bounds.include(poly[0].into());
+							let point = xform(poly[0]);
+							path.move_to(downcast(point));
+							bounds.include(point);
 							for point in poly[1..].into_iter() {
-								path.line_to(downcast(*point));
-								bounds.include((*point).into());
+								let point = xform(*point);
+								path.line_to(downcast(point));
+								bounds.include(point);
 							}
 						}
-						if bounds.max_dimension() / self.scale as i64 > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
+						if bounds.max_dimension() > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
 					},
 				}
 			}
 		}
 	}
+	
+	fn clear(&mut self, canvas: &mut Canvas) {
+		canvas.clear(Color4f::new(0.0, 0.0, 0.0, 1.0));
+	}
 
-	fn draw(&mut self, canvas: &mut Canvas) {
-		canvas.clear(Color::from_argb(0, 0, 0, 255));
-		canvas.scale(((1.0 / self.scale as f64) as f32, (1.0 / self.scale as f64) as f32));
-		canvas.translate((-self.offset.x as f32, -self.offset.y as f32));
-		for tile in self.render.viewport_tiles(&self.viewport(), self.size.0) {
-			self.place_tile(canvas, tile);
+	fn draw(&mut self, canvas: &mut Canvas, tiles: &mut Vec<(u64, Arc<RenderTile>)>) {
+		// These two lines do the transformation for us, but it's not faster and also scales fonts
+		// and line widths, which we don't want.
+		//canvas.scale(((1.0 / self.scale as f64) as f32, (1.0 / self.scale as f64) as f32));
+		//canvas.translate((-self.offset.x as f32, -self.offset.y as f32));
+		for tile in tiles.drain(..) {
+			if tile.0 == self.generation {
+				self.place_tile(canvas, tile.1);
+			}
 		}
 	}
 }
 
 fn main() {
-	let maps: Vec<mapsforge::MapFile> = std::env::args().skip(1).map(|path| mapsforge::MapFile::new(PathBuf::from(path))).collect();
+	let maps: Vec<Arc<mapsforge::MapFile>> = std::env::args().skip(1).map(|path| Arc::new(mapsforge::MapFile::new(PathBuf::from(path)))).collect();
 	if maps.is_empty() {
 		println!("Nothing to display");
 		return;
@@ -353,17 +395,28 @@ fn main() {
 
 	let mut viewer = Viewer::new(maps, (size.0, size.1));
 	let mut redraw = true;
+	renderer.draw(RafxExtents2D { width: size.0, height: size.1 }, 1.0, |canvas, _| {
+		canvas.clear(Color::from_argb(0, 0, 0, 255));
+	}).unwrap();
 
 	loop {
 		events.update(!redraw);
 		if events.should_quit { break; }
 		let size = window.vulkan_drawable_size();
+		let extents = RafxExtents2D { width: size.0, height: size.1 };
 		redraw = viewer.update(&mut events, (size.0, size.1));
-		if redraw || events.force_redraw {
-			renderer.draw(RafxExtents2D { width: size.0, height: size.1 }, 1.0, |canvas, _coordinate_helper| {
-				viewer.draw(canvas);
-				events.frames += 1;
+		if redraw {
+			viewer.render.async_viewport_tiles(&viewer.viewport(), viewer.size.0, events.frames, events.get_updater());
+			// Without this call, junk on the canvas is not cleared when the window is resized.  Race condition?
+			renderer.draw(extents, 1.0, |_canvas, _| {
+				//viewer.clear(canvas);
 			}).unwrap();
 		}
+		else if !events.tiles_ready.is_empty() {
+			renderer.draw(extents, 1.0, |canvas, _| {
+				viewer.draw(canvas, &mut events.tiles_ready);
+			}).unwrap();
+		}
+		events.frames += 1;
 	}
 }

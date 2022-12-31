@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use super::mapsforge;
 use super::mapsforge::{Coord, TagValue};
+use super::UpdateEvent;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BoundingBox {
@@ -146,13 +148,13 @@ pub struct Object {
 
 pub struct RenderTile {
 	pub zoom: u8,
-	pub x: u32,
-	pub y: u32,
+	pub x: i64,
+	pub y: i64,
 	pub layers: BTreeMap<i8, Vec<Object>>,
 }
 
 impl RenderTile {
-	fn new(tile: mapsforge::Tile, zoom: u8, x: u32, y: u32) -> Self {
+	fn new(tile: mapsforge::Tile, zoom: u8, x: i64, y: i64) -> Self {
 		let mut layers = BTreeMap::new();
 		for way in &tile.ways {
 			if let Some(material) = Material::from_tags(&way.tags) {
@@ -171,28 +173,35 @@ impl RenderTile {
 		Self { zoom, x, y, layers }
 	}
 
+	fn empty(zoom: u8, x: i64, y: i64) -> Self {
+		Self { zoom, x, y, layers: BTreeMap::new() }
+	}
+
 	pub fn bounds(&self) -> BoundingBox {
+		let tile_size = mapsforge::COORD_MAX >> self.zoom;
 		BoundingBox::from_corners((
-			mapsforge::tile_origin(self.zoom, self.x, self.y).to_coord(),
-			mapsforge::tile_origin(self.zoom, self.x + 1, self.y + 1).to_coord(),
+			Coord { x: tile_size * self.x, y: tile_size * self.y },
+			Coord { x: tile_size * (self.x + 1), y: tile_size * (self.y + 1) },
 		))
 	}
 }
 
-fn visible_tiles(viewport: &BoundingBox, zoom: u8) -> ((u32, u32), (u32, u32)) {
-	let tileidx = |coord: i64| (coord.clamp(0, mapsforge::COORD_MAX) / (mapsforge::COORD_MAX >> zoom)) as u32;
+fn visible_tiles(viewport: &BoundingBox, zoom: u8) -> ((i64, i64), (i64, i64)) {
+	let tileidx = |coord: i64| coord.div_floor(mapsforge::COORD_MAX >> zoom);
 	let (min, max) = viewport.corners().unwrap();
 	((tileidx(min.x), tileidx(max.x)), (tileidx(min.y), tileidx(max.y)))
 }
 
-pub struct RenderCache {
-	pub maps: Vec<mapsforge::MapFile>,
-	tiles: HashMap<(PathBuf, u8), HashMap<(u32, u32), Arc<RenderTile>>>,
+pub struct RenderManager {
+	pub maps: Vec<Arc<mapsforge::MapFile>>,
+	tiles: HashMap<(PathBuf, u8), Arc<Mutex<HashMap<(u32, u32), Arc<RenderTile>>>>>,
+	cur_generation: Arc<AtomicU64>,
+	render_threads: rayon::ThreadPool,
 }
 
-impl RenderCache {
-	pub fn new(maps: Vec<mapsforge::MapFile>) -> Self {
-		Self { maps, tiles: HashMap::new() }
+impl RenderManager {
+	pub fn new(maps: Vec<Arc<mapsforge::MapFile>>) -> Self {
+		Self { maps, tiles: HashMap::new(), cur_generation: Arc::new(AtomicU64::new(0)), render_threads: rayon::ThreadPoolBuilder::new().build().unwrap() }
 	}
 
 	pub fn bounds(&self) -> BoundingBox {
@@ -201,22 +210,44 @@ impl RenderCache {
 			.fold(BoundingBox::empty(), |accum, cur| accum.union(&cur))
 	}
 
-	pub fn viewport_tiles(&mut self, viewport: &BoundingBox, winwidth: u32) -> Vec<Arc<RenderTile>> {
+	pub fn async_viewport_tiles(&mut self, viewport: &BoundingBox, winwidth: u32, generation: u64, updater: super::Updater) {
+		self.cur_generation.store(generation, Ordering::Relaxed);
 		let deg_lon_per_px = viewport.width() as f64 * 360.0 / (winwidth as f64 * mapsforge::COORD_MAX as f64);
-		let mut ret = vec![];
 		for map in &self.maps {
 			if BoundingBox::from_corners(map.bounds()).intersection(viewport).is_empty() { continue; }
 			let maybe_zoom = map.desired_zoom_level(deg_lon_per_px);
 			if let Some(zoom) = maybe_zoom {
 				let (xrange, yrange) = visible_tiles(&viewport, zoom);
-				let zoom_cache = self.tiles.entry((map.path().to_path_buf(), zoom)).or_insert(HashMap::new());
-				for x in xrange.0..=xrange.1 {
-					for y in yrange.0..=yrange.1 {
-						ret.push(zoom_cache.entry((x, y)).or_insert_with(|| Arc::new(RenderTile::new(map.tile(zoom, x, y), zoom, x, y))).clone())
+				let zoom_cache = self.tiles.entry((map.path().to_path_buf(), zoom)).or_insert(Arc::new(Mutex::new(HashMap::new())));
+				let ntile = 1 << zoom;
+				for y in yrange.0..=yrange.1 {
+					for x in xrange.0..=xrange.1 {
+						if y <= 0 || x <= 0 || y > ntile || x > ntile {
+							updater.send(UpdateEvent::Tile { generation, tile: Arc::new(RenderTile::empty(zoom, x, y)) });
+						}
+						else {
+							let (x, y) = (x as u32, y as u32);
+							let thread_updater = updater.clone();
+							let thread_map = map.clone();
+							let thread_cache = zoom_cache.clone();
+							let thread_generation = self.cur_generation.clone();
+							self.render_threads.spawn(move || {
+								if generation < thread_generation.load(Ordering::Relaxed) { return; }
+								let cached_tile = thread_cache.lock().expect("Poisoned lock").get(&(x, y)).cloned();
+								let tile = if let Some(existing_tile) = cached_tile {
+									existing_tile.clone()
+								}
+								else {
+									let new_tile = Arc::new(RenderTile::new(thread_map.tile(zoom, x, y), zoom, x as i64, y as i64));
+									thread_cache.lock().expect("Poisoned lock").insert((x, y), new_tile.clone());
+									new_tile
+								};
+								thread_updater.send(UpdateEvent::Tile { generation, tile });
+							});
+						}
 					}
 				}
 			}
 		}
-		ret
 	}
 }
