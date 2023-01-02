@@ -12,11 +12,12 @@ use sdl2::event::{Event, EventSender, WindowEvent};
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
 
-mod render;
 mod mapsforge;
+mod render;
+mod theme;
 
 use mapsforge::Coord;
-use render::{BoundingBox, Geometry, Material, RenderManager, RenderTile};
+use render::{BoundingBox, Geometry, RenderManager, RenderTile};
 
 const ZOOM_MULTIPLIER: f64 = 1.2;
 const PAN_INCREMENT: i32 = 100;
@@ -161,66 +162,11 @@ struct Viewer {
 	scale: u32, // Coord units per pixel -- larger is zooming out
 	font: Font,
 	text_paint: Paint,
-	paints: HashMap<Material, Paint>,
 	render: RenderManager,
 	generation: u64,
 }
 
 impl Viewer {
-	fn paint_styles() -> HashMap<Material, Paint> {
-		let mut ret = HashMap::new();
-		ret.insert(Material::Unknown, {
-			let mut paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Stroke);
-			paint.set_stroke_width(2.0);
-			paint
-		});
-		ret.insert(Material::Land, {
-			let mut paint = Paint::new(Color4f::new(0.8, 0.8, 0.8, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Fill);
-			paint.set_stroke(false);
-			paint
-		});
-		ret.insert(Material::Water, {
-			let mut paint = Paint::new(Color4f::new(0.5, 0.5, 1.0, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Fill);
-			paint.set_stroke(false);
-			paint
-		});
-		ret.insert(Material::Road, {
-			let mut paint = Paint::new(Color4f::new(0.1, 0.1, 0.1, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Stroke);
-			paint.set_stroke(true);
-			paint
-		});
-		ret.insert(Material::Building, {
-			let mut paint = Paint::new(Color4f::new(0.3, 0.3, 0.3, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Fill);
-			paint.set_stroke(false);
-			paint
-		});
-		ret.insert(Material::Greenspace, {
-			let mut paint = Paint::new(Color4f::new(0.8, 1.0, 0.8, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Fill);
-			paint.set_stroke(false);
-			paint
-		});
-		ret.insert(Material::Barrier, {
-			let mut paint = Paint::new(Color4f::new(0.5, 0.2, 0.0, 0.5), None);
-			paint.set_anti_alias(true);
-			paint.set_style(paint::Style::Stroke);
-			paint.set_stroke(true);
-			paint
-		});
-		ret
-	}
-
 	fn zoom_to_fit(&mut self) {
 		let bounds = self.render.bounds();
 		self.scale = (bounds.width() as u32 / self.size.0).max(bounds.height() as u32 / self.size.1);
@@ -231,13 +177,12 @@ impl Viewer {
 	fn new(maps: Vec<Arc<mapsforge::MapFile>>, init_size: (u32, u32)) -> Self {
 		let mut font = Font::default();
 		font.set_size(10.0);
-		let paints = Self::paint_styles();
 		let mut text_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 1.0), None);
 		text_paint.set_anti_alias(true);
 		text_paint.set_style(paint::Style::Fill);
 		text_paint.set_stroke(false);
 		let render = RenderManager::new(maps);
-		let mut ret = Self { size: init_size, offset: Coord { x: 0, y: 0 }, scale: 0, font, text_paint, paints, render, generation: 0 };
+		let mut ret = Self { size: init_size, offset: Coord { x: 0, y: 0 }, scale: 0, font, text_paint, render, generation: 0 };
 		ret.zoom_to_fit();
 		ret
 	}
@@ -330,10 +275,13 @@ impl Viewer {
 			for obj in objs {
 				match &obj.geo {
 					Geometry::Point(point) => {
-						/*canvas.draw_point(downcast(*point), &self.paints[&obj.material]);
+						let loc = downcast(xform(*point));
+						for paint in obj.material.paints() {
+							canvas.draw_point(loc, &paint);
+						}
 						if let Some(name) = &obj.name {
-							canvas.draw_str(name, downcast(*point), &self.font, &self.text_paint);
-						}*/
+							canvas.draw_str(name, loc, &self.font, &self.text_paint);
+						}
 					},
 					Geometry::Path(polies) => {
 						let mut path = Path::new();
@@ -348,7 +296,15 @@ impl Viewer {
 								bounds.include(point);
 							}
 						}
-						if bounds.max_dimension() > MAX_DETAIL { canvas.draw_path(&path, &self.paints[&obj.material]); }
+						if bounds.max_dimension() > MAX_DETAIL {
+							for paint in obj.material.paints() {
+								canvas.draw_path(&path, &paint);
+							}
+							/*if let Some(name) = &obj.name {
+								let loc = downcast(bounds.midpoint().expect("No midpoint of non-mepty bounding box"));
+								canvas.draw_str(name, loc, &self.font, &self.text_paint);
+							}*/
+						}
 					},
 				}
 			}

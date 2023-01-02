@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use super::theme;
 use super::mapsforge;
-use super::mapsforge::{Coord, TagValue};
+use super::mapsforge::Coord;
 use super::UpdateEvent;
 
 #[derive(Debug, Clone, Copy)]
@@ -92,49 +93,6 @@ impl BoundingBox {
 	}
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub enum Material {
-	Unknown,
-	Land,
-	Water,
-	Road,
-	Building,
-	Barrier,
-	Greenspace,
-}
-
-impl Material {
-	fn from_tags(tags: &HashMap<String, TagValue>) -> Option<Self> {
-		if let Some(TagValue::Literal(natural)) = tags.get("natural") {
-			match natural.as_ref() {
-				"sea" | "water" => Some(Self::Water),
-				"nosea" => Some(Self::Land),
-				"grassland" | "heath" | "land" | "marsh" | "scrub" | "wetland" => Some(Self::Greenspace),
-				"" => None,
-				_ => None,
-			}
-		}
-		else if let Some(TagValue::Literal(leisure)) = tags.get("leisure") {
-			match leisure.as_ref() {
-				"dog_park" | "garden" | "nature_reserve" | "park" | "pitch" | "playground" => Some(Self::Greenspace),
-				"" => None,
-				_ => None,
-			}
-		}
-		else if let Some(TagValue::Literal(landuse)) = tags.get("landuse") {
-			match landuse.as_ref() {
-				"brownfield" | "cemetery" | "farm" | "farmland" | "farmyard" | "forest" | "grass" | "meadow" | "orchard" | "recreation_ground" | "village_green" | "vineyard" | "wood" => Some(Self::Greenspace),
-				"" => None,
-				_ => None,
-			}
-		}
-		else if tags.contains_key("building") { Some(Self::Building) }
-		else if tags.contains_key("highway") { Some(Self::Road) }
-		else if tags.contains_key("barrier") { Some(Self::Barrier) }
-		else { None }
-	}
-}
-
 pub enum Geometry {
 	Path(Vec<Vec<Coord>>),
 	Point(Coord),
@@ -143,7 +101,7 @@ pub enum Geometry {
 pub struct Object {
 	pub geo: Geometry,
 	pub name: Option<String>,
-	pub material: Material,
+	pub material: theme::Material,
 }
 
 pub struct RenderTile {
@@ -154,20 +112,20 @@ pub struct RenderTile {
 }
 
 impl RenderTile {
-	fn new(tile: mapsforge::Tile, zoom: u8, x: i64, y: i64) -> Self {
+	fn new(tile: mapsforge::Tile, zoom: u8, x: i64, y: i64, theme: &theme::Theme) -> Self {
 		let mut layers = BTreeMap::new();
 		for way in &tile.ways {
-			if let Some(material) = Material::from_tags(&way.tags) {
+			if let Some(material) = theme.match_way(&way) {
 				for block in way.project(&tile) {
 					let geo = Geometry::Path(block);
-					layers.entry(way.layer).or_insert(vec![]).push(Object { geo, name: way.name.clone(), material });
+					layers.entry(way.layer).or_insert(vec![]).push(Object { geo, name: way.name.clone(), material: material.clone() });
 				}
 			}
 		}
 		for poi in &tile.pois {
-			if let Some(material) = Material::from_tags(&poi.tags) {
+			if let Some(material) = theme.match_poi(&poi) {
 				let geo = Geometry::Point(poi.project(&tile));
-				layers.entry(poi.layer).or_insert(vec![]).push(Object { geo, name: poi.name.clone(), material });
+				layers.entry(poi.layer).or_insert(vec![]).push(Object { geo, name: poi.name.clone(), material: material.clone() });
 			}
 		}
 		Self { zoom, x, y, layers }
@@ -194,6 +152,7 @@ fn visible_tiles(viewport: &BoundingBox, zoom: u8) -> ((i64, i64), (i64, i64)) {
 
 pub struct RenderManager {
 	pub maps: Vec<Arc<mapsforge::MapFile>>,
+	theme: Arc<theme::Theme>,
 	tiles: HashMap<(PathBuf, u8), Arc<Mutex<HashMap<(u32, u32), Arc<RenderTile>>>>>,
 	cur_generation: Arc<AtomicU64>,
 	render_threads: rayon::ThreadPool,
@@ -201,7 +160,7 @@ pub struct RenderManager {
 
 impl RenderManager {
 	pub fn new(maps: Vec<Arc<mapsforge::MapFile>>) -> Self {
-		Self { maps, tiles: HashMap::new(), cur_generation: Arc::new(AtomicU64::new(0)), render_threads: rayon::ThreadPoolBuilder::new().build().unwrap() }
+		Self { maps, theme: Arc::new(theme::basic()), tiles: HashMap::new(), cur_generation: Arc::new(AtomicU64::new(0)), render_threads: rayon::ThreadPoolBuilder::new().build().unwrap() }
 	}
 
 	pub fn bounds(&self) -> BoundingBox {
@@ -231,6 +190,7 @@ impl RenderManager {
 							let thread_map = map.clone();
 							let thread_cache = zoom_cache.clone();
 							let thread_generation = self.cur_generation.clone();
+							let thread_theme = self.theme.clone();
 							self.render_threads.spawn(move || {
 								if generation < thread_generation.load(Ordering::Relaxed) { return; }
 								let cached_tile = thread_cache.lock().expect("Poisoned lock").get(&(x, y)).cloned();
@@ -238,7 +198,7 @@ impl RenderManager {
 									existing_tile.clone()
 								}
 								else {
-									let new_tile = Arc::new(RenderTile::new(thread_map.tile(zoom, x, y), zoom, x as i64, y as i64));
+									let new_tile = Arc::new(RenderTile::new(thread_map.tile(zoom, x, y), zoom, x as i64, y as i64, &thread_theme));
 									thread_cache.lock().expect("Poisoned lock").insert((x, y), new_tile.clone());
 									new_tile
 								};

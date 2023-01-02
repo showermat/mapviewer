@@ -116,7 +116,7 @@ impl TagDesc {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TagValue {
 	Literal(String),
 	Byte(i8),
